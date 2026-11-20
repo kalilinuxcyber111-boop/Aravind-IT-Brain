@@ -1,8 +1,8 @@
 // Aravind IT Brain - serverless backend (Vercel). MIT License.
-// Gemini API with automatic retry + backup models.
+// Gemini API with timeouts, retry and backup models.
 
-const PRIMARY = process.env.GEMINI_MODEL || "gemini-3.8-flash";
-const FALLBACKS = (process.env.GEMINI_FALLBACK_MODELS || "gemini-3.5-flash,gemini-2.5-flash-lite")
+const PRIMARY = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const FALLBACKS = (process.env.GEMINI_FALLBACK_MODELS || "")
   .split(",").map((s) => s.trim()).filter(Boolean);
 
 const SYS =
@@ -26,25 +26,51 @@ const DEEP =
   "DEEP ANALYSIS + WEB SEARCH: search the web for this exact error text/code, prefer official vendor docs (Microsoft Learn, Dell, HP, Lenovo, Cisco etc.). " +
   "Explain what the error means, list likely root causes ranked by probability, give fixes in order, and what to check if it still fails.";
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const BUDGET_MS = 50000; // stay under Vercel's 60s limit
 
-async function callModel(model, body, key) {
-  const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-goog-api-key": key },
-    body: JSON.stringify(body),
-  });
-  const data = await r.json().catch(() => ({}));
-  return { ok: r.ok, status: r.status, data, msg: (data.error && data.error.message) || "" };
+async function callModel(model, body, key, timeoutMs) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    const data = await r.json().catch(() => ({}));
+    return { ok: r.ok, status: r.status, data, msg: (data.error && data.error.message) || "" };
+  } catch (e) {
+    return { ok: false, status: 504, data: {}, msg: e.name === "AbortError" ? "timeout (model slow)" : e.message };
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 module.exports = async (req, res) => {
-  if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
-
   const key = process.env.GEMINI_API_KEY;
-  if (!key) return res.status(500).json({ error: "GEMINI_API_KEY is not set in Vercel Environment Variables." });
-
   const pw = process.env.APP_PASSWORD;
+
+  // Helper: open /api/chat?list=YOUR_PASSWORD to see which models your key can use
+  if (req.method === "GET") {
+    if (!key) return res.status(500).json({ error: "GEMINI_API_KEY is not set." });
+    if (pw && req.query.list !== pw) return res.status(401).json({ error: "Use /api/chat?list=YOUR_PASSWORD" });
+    try {
+      const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200", {
+        headers: { "x-goog-api-key": key },
+      });
+      const d = await r.json();
+      const names = (d.models || [])
+        .filter((m) => (m.supportedGenerationMethods || []).includes("generateContent"))
+        .map((m) => m.name.replace("models/", ""));
+      return res.status(200).json({ configured: PRIMARY, models: names });
+    } catch (e) {
+      return res.status(500).json({ error: e.message });
+    }
+  }
+
+  if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
+  if (!key) return res.status(500).json({ error: "GEMINI_API_KEY is not set in Vercel Environment Variables." });
   if (pw && req.headers["x-app-password"] !== pw) return res.status(401).json({ error: "Wrong or missing password." });
 
   const { messages = [], images = [], deep = false, mode = "fix" } = req.body || {};
@@ -63,38 +89,31 @@ module.exports = async (req, res) => {
   if (deep) body.tools = [{ google_search: {} }];
 
   const models = [PRIMARY, ...FALLBACKS.filter((m) => m !== PRIMARY)];
+  const start = Date.now();
   let lastErr = "AI service error";
 
-  try {
-    for (let i = 0; i < models.length; i++) {
-      const attempts = i === 0 ? 2 : 1;
-      for (let a = 0; a < attempts; a++) {
-        const out = await callModel(models[i], body, key);
-        if (out.ok) {
-          const cand = out.data.candidates && out.data.candidates[0];
-          const text = ((cand && cand.content && cand.content.parts) || []).map((p) => p.text || "").join("").trim();
-          const chunks = (cand && cand.groundingMetadata && cand.groundingMetadata.groundingChunks) || [];
-          const seen = new Set();
-          const sources = chunks
-            .map((c) => c.web)
-            .filter((w) => w && w.uri && !seen.has(w.uri) && seen.add(w.uri))
-            .slice(0, 6)
-            .map((w) => ({ title: w.title || w.uri, uri: w.uri }));
-          return res.status(200).json({
-            text: text || "No answer came back (maybe blocked). Try rephrasing or fewer photos.",
-            sources,
-            model: models[i],
-          });
-        }
-        lastErr = out.msg || "AI service error (" + out.status + ")";
-        // Bad key / bad request: no point retrying
-        if (out.status === 401 || out.status === 403) return res.status(out.status).json({ error: lastErr });
-        // Busy or model unavailable: wait a little, retry, then try next model
-        if (a < attempts - 1) await sleep(1500);
-      }
+  for (const model of models) {
+    const remaining = BUDGET_MS - (Date.now() - start);
+    if (remaining < 6000) break;
+    const out = await callModel(model, body, key, Math.min(20000, remaining - 1000));
+
+    if (out.ok) {
+      const cand = out.data.candidates && out.data.candidates[0];
+      const text = ((cand && cand.content && cand.content.parts) || []).map((p) => p.text || "").join("").trim();
+      const chunks = (cand && cand.groundingMetadata && cand.groundingMetadata.groundingChunks) || [];
+      const seen = new Set();
+      const sources = chunks
+        .map((c) => c.web)
+        .filter((w) => w && w.uri && !seen.has(w.uri) && seen.add(w.uri))
+        .slice(0, 6)
+        .map((w) => ({ title: w.title || w.uri, uri: w.uri }));
+      return res.status(200).json({
+        text: text || "No answer came back (maybe blocked). Try rephrasing or fewer photos.",
+        sources,
+      });
     }
-    return res.status(503).json({ error: "Ella models-um ippo busy: " + lastErr });
-  } catch (e) {
-    return res.status(500).json({ error: "Server error: " + e.message });
+    lastErr = model + ": " + (out.msg || "error " + out.status);
+    if (out.status === 401 || out.status === 403) return res.status(out.status).json({ error: lastErr });
   }
+  return res.status(503).json({ error: "Model busy / slow. Konjam neram kazhichu try pannunga. (" + lastErr + ")" });
 };
